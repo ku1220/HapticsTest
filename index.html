@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Video + Vibration (Audio RMS)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    video { width: min(100%, 420px); border-radius: 12px; background: #000; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #fff; }
+    button:disabled { opacity: .5; }
+    canvas { width: min(100%, 420px); height: 90px; border: 1px solid #ddd; border-radius: 12px; }
+    .hint { color: #555; font-size: 13px; }
+    .warn { color: #b00; font-size: 13px; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background:#f2f2f2; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h2>動画 + 振動（音量→バイブ）</h2>
+
+  <div class="row">
+    <input id="file" type="file" accept="video/*" />
+    <button id="prepare" disabled>準備（解析）</button>
+    <button id="play" disabled>再生（振動ON）</button>
+    <button id="stop" disabled>停止</button>
+  </div>
+
+  <p class="hint">
+    <span class="pill">Android Chrome推奨</span>
+    iOS Safariはバイブ制御が難しいです。動画は10秒以内推奨。
+  </p>
+  <p id="status" class="hint">ファイルを選択してください。</p>
+  <p id="warn" class="warn"></p>
+
+  <video id="video" playsinline muted controls></video>
+  <div style="margin-top: 10px;">
+    <canvas id="wave" width="840" height="180"></canvas>
+  </div>
+
+<script>
+(() => {
+  const fileEl = document.getElementById('file');
+  const prepareBtn = document.getElementById('prepare');
+  const playBtn = document.getElementById('play');
+  const stopBtn = document.getElementById('stop');
+  const video = document.getElementById('video');
+  const statusEl = document.getElementById('status');
+  const warnEl = document.getElementById('warn');
+  const canvas = document.getElementById('wave');
+  const ctx2d = canvas.getContext('2d');
+
+  // --- Config ---
+  const TIMEBASE_HZ = 100;          // 10ms刻み
+  const FRAME_SEC = 1 / TIMEBASE_HZ;
+  const LOOKAHEAD_SEC = 0.12;       // 先読み（振動の遅延吸収）
+  const TICK_MS = 30;               // スケジューラの起動間隔
+  const MIN_VIBE_GAP_MS = 35;       // 連打しすぎ防止（OS間引き対策）
+  const DURATIONS_MS = {            // “強さ”を長さで表現
+    strong: 25,
+    mid: 15,
+    light: 8,
+    off: 0
+  };
+
+  // --- State ---
+  let objectUrl = null;
+  let audioCtx = null;
+  let amp = null;          // Float32Array (0..1)
+  let durationSec = 0;
+  let schedulerTimer = null;
+  let lastVibeAt = 0;
+  let nextIndex = 0;
+  let prepared = false;
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+  function setWarn(msg) { warnEl.textContent = msg || ''; }
+
+  function supportsVibrate() {
+    return typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function';
+  }
+
+  // Simple compressor curve for nicer feel
+  function compress01(x) {
+    // x: 0..1
+    // Soft knee-ish: raise small values, avoid clipping
+    const a = 0.55; // tweak
+    return Math.min(1, Math.pow(x, a));
+  }
+
+  function drawWave(values) {
+    const w = canvas.width, h = canvas.height;
+    ctx2d.clearRect(0, 0, w, h);
+    ctx2d.fillStyle = '#f7f7f7';
+    ctx2d.fillRect(0, 0, w, h);
+
+    // baseline
+    ctx2d.strokeStyle = '#ddd';
+    ctx2d.beginPath();
+    ctx2d.moveTo(0, h - 20);
+    ctx2d.lineTo(w, h - 20);
+    ctx2d.stroke();
+
+    if (!values) return;
+
+    ctx2d.fillStyle = '#222';
+    const n = values.length;
+    const barW = Math.max(1, Math.floor(w / n));
+    for (let i = 0; i < n; i++) {
+      const v = values[i];
+      const barH = Math.max(1, Math.floor(v * (h - 40)));
+      const x = i * (w / n);
+      const y = (h - 20) - barH;
+      ctx2d.fillRect(x, y, barW, barH);
+    }
+  }
+
+  // Decode audio from the selected video file, compute RMS per 10ms frame
+  async function analyzeToAmp(file) {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    setStatus('音声を抽出・デコード中…');
+    const buf = await file.arrayBuffer();
+    const audioBuffer = await audioCtx.decodeAudioData(buf.slice(0));
+
+    // mixdown to mono in JS (fast enough for 10 sec)
+    const sr = audioBuffer.sampleRate;
+    const len = audioBuffer.length;
+    const ch = audioBuffer.numberOfChannels;
+
+    const mono = new Float32Array(len);
+    for (let c = 0; c < ch; c++) {
+      const data = audioBuffer.getChannelData(c);
+      for (let i = 0; i < len; i++) mono[i] += data[i];
+    }
+    for (let i = 0; i < len; i++) mono[i] /= ch;
+
+    durationSec = audioBuffer.duration;
+    const frameSamples = Math.max(1, Math.floor(sr * FRAME_SEC));
+    const frames = Math.ceil(len / frameSamples);
+    const out = new Float32Array(frames);
+
+    // RMS per frame
+    let maxRms = 1e-9;
+    for (let f = 0; f < frames; f++) {
+      const start = f * frameSamples;
+      const end = Math.min(len, start + frameSamples);
+      let sum = 0;
+      for (let i = start; i < end; i++) {
+        const x = mono[i];
+        sum += x * x;
+      }
+      const rms = Math.sqrt(sum / Math.max(1, end - start));
+      out[f] = rms;
+      if (rms > maxRms) maxRms = rms;
+    }
+
+    // Normalize 0..1, compress, gate
+    const gate = 0.06; // tweak: small values off
+    for (let i = 0; i < out.length; i++) {
+      let v = out[i] / maxRms;
+      v = compress01(v);
+      v = (v < gate) ? 0 : v;
+      out[i] = v;
+    }
+    return out;
+  }
+
+  function ampToVibeMs(a) {
+    // Map amplitude to vibration duration
+    if (a >= 0.70) return DURATIONS_MS.strong;
+    if (a >= 0.45) return DURATIONS_MS.mid;
+    if (a >= 0.25) return DURATIONS_MS.light;
+    return 0;
+  }
+
+  function stopAll() {
+    if (schedulerTimer) {
+      clearInterval(schedulerTimer);
+      schedulerTimer = null;
+    }
+    nextIndex = 0;
+    lastVibeAt = 0;
+    try { navigator.vibrate(0); } catch {}
+    if (!video.paused) video.pause();
+    stopBtn.disabled = true;
+    playBtn.disabled = !prepared;
+    setStatus(prepared ? '停止しました。' : 'ファイルを選択してください。');
+  }
+
+  function startScheduler() {
+    if (!supportsVibrate()) {
+      setWarn('このブラウザでは navigator.vibrate が使えません（Android Chrome推奨）。');
+    } else {
+      setWarn('');
+    }
+
+    // Reset scheduling cursor
+    nextIndex = Math.max(0, Math.floor(video.currentTime * TIMEBASE_HZ));
+    lastVibeAt = 0;
+
+    // Periodically schedule vibrations based on currentTime
+    schedulerTimer = setInterval(() => {
+      if (video.paused || video.ended || !amp) return;
+
+      const nowSec = video.currentTime;
+      const targetSec = nowSec + LOOKAHEAD_SEC;
+      const targetIndex = Math.min(amp.length - 1, Math.floor(targetSec * TIMEBASE_HZ));
+
+      // Walk forward from nextIndex to targetIndex (small range)
+      for (; nextIndex <= targetIndex; nextIndex++) {
+        const a = amp[nextIndex];
+        const dur = ampToVibeMs(a);
+        if (dur <= 0) continue;
+
+        const t = performance.now();
+        if (t - lastVibeAt < MIN_VIBE_GAP_MS) continue;
+
+        // Fire vibration (no intensity control; duration is proxy)
+        if (supportsVibrate()) {
+          try { navigator.vibrate(dur); } catch {}
+        }
+        lastVibeAt = t;
+      }
+    }, TICK_MS);
+  }
+
+  // --- UI wiring ---
+  fileEl.addEventListener('change', () => {
+    prepared = false;
+    amp = null;
+    playBtn.disabled = true;
+    stopBtn.disabled = true;
+    prepareBtn.disabled = !fileEl.files?.[0];
+    setWarn('');
+    setStatus(fileEl.files?.[0] ? '準備ボタンを押して解析します。' : 'ファイルを選択してください。');
+
+    // load video preview
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    const file = fileEl.files?.[0];
+    if (file) {
+      objectUrl = URL.createObjectURL(file);
+      video.src = objectUrl;
+      video.load();
+    }
+  });
+
+  prepareBtn.addEventListener('click', async () => {
+    const file = fileEl.files?.[0];
+    if (!file) return;
+
+    // user gesture -> allow AudioContext resume
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    prepareBtn.disabled = true;
+    playBtn.disabled = true;
+    stopBtn.disabled = true;
+    setWarn('');
+
+    try {
+      amp = await analyzeToAmp(file);
+      prepared = true;
+      drawWave(amp);
+      setStatus(`解析完了（${durationSec.toFixed(2)}s / ${amp.length} frames @${TIMEBASE_HZ}Hz）`);
+      playBtn.disabled = false;
+    } catch (e) {
+      console.error(e);
+      setWarn('解析に失敗しました。別の動画で試してください。');
+      setStatus('エラー。');
+      prepareBtn.disabled = false;
+    }
+  });
+
+  playBtn.addEventListener('click', async () => {
+    if (!prepared || !amp) return;
+
+    // Ensure AudioContext is ok (not strictly needed for playback, but keeps gesture gating consistent)
+    if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume();
+
+    // Start from beginning for consistent feel (必要なら消してOK)
+    video.currentTime = 0;
+
+    // Start playback + vibration scheduler
+    await video.play();
+    playBtn.disabled = true;
+    stopBtn.disabled = false;
+    setStatus('再生中（振動ON）…');
+
+    // Reset any old scheduler
+    if (schedulerTimer) clearInterval(schedulerTimer);
+    startScheduler();
+  });
+
+  stopBtn.addEventListener('click', stopAll);
+  video.addEventListener('pause', () => {
+    // Pause stops vibrations too
+    if (schedulerTimer) {
+      clearInterval(schedulerTimer);
+      schedulerTimer = null;
+    }
+    try { navigator.vibrate(0); } catch {}
+    if (prepared) {
+      setStatus('一時停止しました。');
+      playBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+  });
+  video.addEventListener('ended', stopAll);
+
+  // Initial
+  drawWave(null);
+  prepareBtn.disabled = true;
+  playBtn.disabled = true;
+  stopBtn.disabled = true;
+})();
+</script>
+</body>
+</html>
